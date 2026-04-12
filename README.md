@@ -151,19 +151,6 @@ US = snell, 1.2.3.4, 44321, psk = x7k9mP2qR5sL8vN4wJ6yZ, version = 5, reuse = tr
 
 ---
 
-## 📝 更新日志
-
-### v1.2.0
-- 重构代码结构，提取公共函数
-- 修复 Bash 3.x 兼容性
-- 修复 `ss` 端口占用检测正则
-- 增加 `--force-uninstall`、`-U/--update`、`-r/--restart` 等快捷命令
-- 增加 `NO_COLOR` 和 `EASYSNELL_NO_CLEAR` 环境变量支持
-- 日志输出统一改为 stderr
-- 卸载时自动清理防火墙规则、BBR 配置和系统用户
-
----
-
 ## ⚠️ 免责声明
 
 本项目仅供学习和技术研究使用，请勿用于违反当地法律法规的活动。使用本脚本所产生的一切后果由使用者自行承担。
@@ -173,10 +160,3 @@ US = snell, 1.2.3.4, 44321, psk = x7k9mP2qR5sL8vN4wJ6yZ, version = 5, reuse = tr
 ## 📄 许可证
 
 [MIT License](./LICENSE)
-
----
-
-## 🙏 致谢
-
-- [Surge](https://nssurge.com) 团队开发的 Snell 协议
-- [passeway/Snell](https://github.com/passeway/Snell) 项目提供的灵感
