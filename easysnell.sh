@@ -26,8 +26,8 @@ readonly JOURNAL_TAIL_LINES=20
 # 日志文件
 readonly LOG_FILE="${EASYSNELL_LOG:-/var/log/easysnell.log}"
 
-# Dry-run 模式
-DRY_RUN="${DRY_RUN:-0}"
+# Dry-run 模式（预留）
+# DRY_RUN="${DRY_RUN:-0}"
 
 # 回滚标记
 ROLLBACK_REQUIRED=0
@@ -93,9 +93,22 @@ detect_ip() {
 
 detect_country() {
     local ip=$1
-    local country
-    country=$(curl -fsSL -m "${CURL_TIMEOUT}" "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$' || echo "UN")
-    echo "$country"
+    local country=""
+
+    # 尝试 ipinfo.io
+    country=$(curl -fsSL -m "${CURL_TIMEOUT}" "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$')
+
+    # 备用：ip-api.com
+    if [[ -z "$country" ]]; then
+        country=$(curl -fsSL -m "${CURL_TIMEOUT}" "http://ip-api.com/line/${ip}/countryCode" 2>/dev/null | grep -oE '^[A-Z]{2}$')
+    fi
+
+    # 备用：ipapi.co
+    if [[ -z "$country" ]]; then
+        country=$(curl -fsSL -m "${CURL_TIMEOUT}" "https://ipapi.co/${ip}/country_code" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$')
+    fi
+
+    echo "${country:-UN}"
 }
 
 #===============================================================================
@@ -158,21 +171,23 @@ install_deps() {
         debian|ubuntu)
             wait_for_apt
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y -qq wget curl unzip iptables ip6tables
+            apt-get update -qq 2>&1 | grep -v "^Fetched" || true
+            if ! apt-get install -y -qq wget curl unzip iptables ip6tables 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking"; then
+                :  # 静默安装成功
+            fi
             ;;
         centos|rhel|almalinux|rocky|fedora)
             if command -v dnf &>/dev/null; then
-                dnf -y -q install wget curl unzip iptables-services
+                dnf -y install wget curl unzip iptables-services 2>&1 | grep -v "^Last metadata" || true
             else
-                yum -y -q install wget curl unzip iptables-services
+                yum -y install wget curl unzip iptables-services 2>&1 | grep -v "^Package\|^Transaction" || true
             fi
             ;;
         arch|manjaro)
-            pacman -Sy --noconfirm --needed wget curl unzip iptables
+            pacman -Sy --noconfirm --needed wget curl unzip iptables 2>&1 | grep -v "^\[.*\]" || true
             ;;
         alpine)
-            apk add --no-cache wget curl unzip iptables coreutils
+            apk add --no-cache wget curl unzip iptables coreutils 2>&1 | grep -v "^fetch" || true
             ;;
         *)
             log_error "不支持的系统: $os"
@@ -290,8 +305,8 @@ close_firewall_port() {
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 
-    iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
-    ip6tables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+    ip6tables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
 }
 
 #===============================================================================
@@ -371,8 +386,6 @@ generate_config() {
     mkdir -p "${CONF_DIR}"
     # 目录权限: 750 (owner=rwx, group=r-x, other=---)
     chmod 750 "${CONF_DIR}"
-    # 配置目录属于 root:snell
-    chown root:snell "${CONF_DIR}" 2>/dev/null || true
 
     local config_body
     config_body="[snell-server]
@@ -460,7 +473,7 @@ random_port() {
 }
 
 random_psk() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${PSK_LENGTH}"
+    LC_ALL=C tr -dc 'A-Za-z0-9@+-' </dev/urandom | head -c "${PSK_LENGTH}"
 }
 
 #===============================================================================
@@ -769,6 +782,13 @@ update_snell() {
         log_warn "Snell 尚未安装"
         return
     fi
+
+    # 备份旧版本（更新前）
+    log_step "正在备份当前版本..."
+    local snell_bak="${SNELL_DIR}/snell-server.bak.$(date +%s)"
+    cp -p "${SNELL_DIR}/snell-server" "${snell_bak}"
+    log_info "旧版本已备份至 ${snell_bak}"
+
     log_step "正在更新 Snell..."
 
     local arch
@@ -777,7 +797,8 @@ update_snell() {
     local tmp_file
     local tmp_dir
     tmp_file=$(mktemp)
-    tmp_dir=$(mktemp -d)
+    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
+    chmod 700 "${tmp_dir}"
     trap 'rm -f "${tmp_file}"; rm -rf "${tmp_dir}"; systemctl start snell 2>/dev/null || true' EXIT ERR
 
     if ! download_snell "${arch}" "${tmp_file}"; then
@@ -892,7 +913,7 @@ show_menu() {
     echo "  1. 安装 Snell 服务"
     echo "  2. 卸载 Snell 服务"
     if [[ -f "${SNELL_DIR}/snell-server" ]]; then
-        if systemctl is-active --quiet snell 2>/dev/null; then
+        if is_service_active; then
             echo "  3. 停止 Snell 服务"
         else
             echo "  3. 启动 Snell 服务"
@@ -902,9 +923,6 @@ show_menu() {
     echo "  5. 查看 Snell 配置"
     echo "  0. 退出"
     echo -e "${GREEN}=============================================${RESET}"
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        echo -e "${YELLOW}[DRY-RUN 模式]${RESET}"
-    fi
     read -rp "请选择 [0-5]: " choice
 }
 
@@ -918,13 +936,9 @@ quick_install() {
 #===============================================================================
 # 主入口
 #===============================================================================
-# 日志写入文件（所有日志同时输出到 stderr）
+# 日志初始化（目前仅输出到 stderr）
 init_logging() {
-    if [[ -w "${LOG_FILE}" ]] || [[ -w "$(dirname "${LOG_FILE}")" ]]; then
-        exec 3>>"${LOG_FILE}"
-    else
-        exec 3>/dev/null
-    fi
+    :  # 未来可扩展为同时写入 LOG_FILE
 }
 
 # 回滚函数
@@ -989,18 +1003,12 @@ main() {
     check_root
     check_systemd
 
-    # Dry-run 模式检测
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        log_info "[DRY-RUN] 模拟执行模式，不会进行任何实际更改"
-    fi
+    # Dry-run 模式检测（预留）
+    # if [[ "${DRY_RUN}" == "1" ]]; then
+    #     log_info "[DRY-RUN] 模拟执行模式，不会进行任何实际更改"
+    # fi
 
     case "${1:-}" in
-        --dry-run|dry-run)
-            DRY_RUN=1
-            log_info "Dry-run 模式: 仅显示将执行的操作"
-            log_info "使用 DRY_RUN=1 bash easysnell.sh --dry-run ..."
-            exit 0
-            ;;
         -q|--quick|quick)
             quick_install
             exit 0
