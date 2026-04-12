@@ -19,10 +19,19 @@ readonly RANDOM_PORT_MAX=65000
 readonly PSK_LENGTH=24
 readonly CURL_TIMEOUT=5
 readonly APT_LOCK_WAIT_MAX=60
-readonly SYSTEMD_CAP_VER=229
 readonly LIMIT_NOFILE=32768
 readonly SERVICE_VERIFY_SLEEP=2
 readonly JOURNAL_TAIL_LINES=20
+
+# 日志文件
+readonly LOG_FILE="${EASYSNELL_LOG:-/var/log/easysnell.log}"
+
+# Dry-run 模式
+DRY_RUN="${DRY_RUN:-0}"
+
+# 回滚标记
+ROLLBACK_REQUIRED=0
+SNELL_BACKUP_DIR=""
 
 # Colors (TTY detection + NO_COLOR support)
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -36,11 +45,16 @@ else
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; RESET=''
 fi
 
-# Logging helpers (use printf to avoid argument injection)
-log_info()  { printf '%b[INFO]%b  %s\n' "$GREEN" "$RESET" "$*" >&2; }
-log_warn()  { printf '%b[WARN]%b  %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-log_error() { printf '%b[ERROR]%b %s\n' "$RED" "$RESET" "$*" >&2; }
-log_step()  { printf '%b[STEP]%b  %s\n' "$BLUE" "$RESET" "$*" >&2; }
+# Logging helpers (use printf + "$@" to avoid injection and preserve arguments)
+log_info()  { printf '%b[INFO]%b  %s\n' "$GREEN" "$RESET" "$@" >&2; }
+log_warn()  { printf '%b[WARN]%b  %s\n' "$YELLOW" "$RESET" "$@" >&2; }
+log_error() { printf '%b[ERROR]%b %s\n' "$RED" "$RESET" "$@" >&2; }
+log_step()  { printf '%b[STEP]%b  %s\n' "$BLUE" "$RESET" "$@" >&2; }
+
+# Service status helper
+is_service_active() {
+    systemctl is-active --quiet snell 2>/dev/null
+}
 
 #===============================================================================
 # 系统检测
@@ -112,10 +126,21 @@ wait_for_apt() {
         return 0
     fi
 
-    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    # 先检查锁文件是否存在
+    local lock_files="/var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+    local any_lock_exists=0
+    for lock in $lock_files; do
+        if [[ -f "$lock" ]]; then
+            any_lock_exists=1
+            break
+        fi
+    done
+
+    if [[ $any_lock_exists -eq 0 ]]; then
+        return 0
+    fi
+
+    while fuser $lock_files >/dev/null 2>&1; do
         log_warn "等待其他 apt 进程释放... (${i})"
         sleep 2
         i=$((i + 1))
@@ -161,30 +186,65 @@ install_deps() {
 #===============================================================================
 enable_bbr() {
     log_step "检测并尝试开启 BBR..."
-    local kernel_major
-    kernel_major=$(uname -r | cut -d. -f1)
-    if [[ "$kernel_major" -ge 5 ]]; then
-        if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-            if [[ ! -f /etc/sysctl.d/99-bbr.conf ]]; then
-                printf '%s\n%s\n' "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr" > /etc/sysctl.d/99-bbr.conf
-            fi
-            sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
-            if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-                log_info "BBR 已开启"
-            else
-                log_warn "BBR 配置已写入 /etc/sysctl.d/99-bbr.conf，重启后生效"
-            fi
-        else
-            log_info "BBR 已经处于开启状态"
-        fi
+
+    # 解析内核版本 (e.g. "5.10.0-21-amd64" -> major=5, minor=10)
+    local kernel_version=$(uname -r)
+    local kernel_major kernel_minor
+    kernel_major=$(echo "$kernel_version" | cut -d. -f1)
+    kernel_minor=$(echo "$kernel_version" | cut -d. -f2 | cut -d- -f1)
+
+    # 版本比较：5.0+
+    local supports_bbr=0
+    if [[ "$kernel_major" -gt 5 ]] || \
+       [[ "$kernel_major" -eq 5 && "$kernel_minor" -ge 0 ]]; then
+        supports_bbr=1
+    fi
+
+    if [[ "$supports_bbr" -eq 0 ]]; then
+        log_warn "内核版本 < 5.0，无法开启 BBR (当前: ${kernel_version})"
+        return 0
+    fi
+
+    local bbr_enabled=0
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        bbr_enabled=1
+    fi
+
+    if [[ "$bbr_enabled" -eq 1 ]]; then
+        log_info "BBR (IPv4) 已经处于开启状态"
     else
-        log_warn "内核版本 < 5.0，无法开启 BBR (当前: $(uname -r))"
+        if [[ ! -f /etc/sysctl.d/99-bbr.conf ]]; then
+            cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+        fi
+        sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
+        if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+            log_info "BBR (IPv4) 已开启"
+        else
+            log_warn "BBR 配置已写入 /etc/sysctl.d/99-bbr.conf，重启后生效"
+        fi
+    fi
+
+    # 同时检查 IPv6 BBR
+    if [[ -e /proc/sys/net/ipv6/tcp_congestion_control ]]; then
+        if sysctl net.ipv6.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+            log_info "BBR (IPv6) 已经处于开启状态"
+        else
+            # IPv6 BBR 配置
+            if ! grep -q "net.ipv6.tcp_congestion_control" /etc/sysctl.d/99-bbr.conf 2>/dev/null; then
+                printf '\nnet.ipv6.tcp_congestion_control=bbr\n' >> /etc/sysctl.d/99-bbr.conf
+                sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
+            fi
+        fi
     fi
 }
 
 #===============================================================================
 # 防火墙配置
 #===============================================================================
+
 open_firewall_port() {
     local port=$1
     local proto=${2:-tcp}
@@ -205,11 +265,14 @@ open_firewall_port() {
         fi
     fi
 
-    iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
+    # iptables: 只添加一次，用注释标记便于识别和清理
+    if ! iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null; then
+        iptables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+    fi
 
-    ip6tables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || \
-        ip6tables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
+    if ! ip6tables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null; then
+        ip6tables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+    fi
 }
 
 close_firewall_port() {
@@ -265,8 +328,28 @@ download_snell() {
 deploy_binary() {
     local tmp_file=$1
     local tmp_dir
-    tmp_dir=$(mktemp -d)
-    unzip -joq "${tmp_file}" -d "${tmp_dir}"
+    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
+    chmod 700 "${tmp_dir}"
+
+    if ! unzip -o "${tmp_file}" -d "${tmp_dir}" 2>/dev/null; then
+        log_error "解压失败，文件可能已损坏"
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
+
+    if [[ ! -f "${tmp_dir}/snell-server" ]]; then
+        log_error "解压后未找到 snell-server 二进制文件"
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
+
+    # 验证是有效的 ELF 可执行文件
+    if ! file "${tmp_dir}/snell-server" 2>/dev/null | grep -q "ELF"; then
+        log_error "下载的文件不是有效的可执行文件"
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
+
     mkdir -p "${SNELL_DIR}"
     mv "${tmp_dir}/snell-server" "${SNELL_DIR}/snell-server"
     rm -rf "${tmp_dir}"
@@ -286,6 +369,10 @@ generate_config() {
     local dns=${7:-}
 
     mkdir -p "${CONF_DIR}"
+    # 目录权限: 750 (owner=rwx, group=r-x, other=---)
+    chmod 750 "${CONF_DIR}"
+    # 配置目录属于 root:snell
+    chown root:snell "${CONF_DIR}" 2>/dev/null || true
 
     local config_body
     config_body="[snell-server]
@@ -312,16 +399,9 @@ udp = true"
 }
 
 create_systemd_service() {
-    local systemd_ver
-    systemd_ver=$(systemctl --version | head -1 | grep -oE '[0-9]+' | head -1)
-
-    local cap_lines=""
-    if [[ -n "$systemd_ver" && "$systemd_ver" -ge "$SYSTEMD_CAP_VER" ]]; then
-        cap_lines="AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW"
-    else
-        cap_lines="CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW"
-    fi
+    # Snell 只需要绑定特权端口，不需要 NET_ADMIN/NET_RAW
+    # CAP_NET_BIND_SERVICE 从 systemd v229 开始支持 AmbientCapabilities
+    # CapabilityBoundingSet 更广泛支持，因此只使用它
 
     cat > "${SERVICE_FILE}" << EOF
 [Unit]
@@ -334,7 +414,7 @@ Type=simple
 User=snell
 Group=snell
 ExecStart=${SNELL_DIR}/snell-server -c ${CONF_DIR}/snell-server.conf
-${cap_lines}
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 LimitNOFILE=${LIMIT_NOFILE}
 Restart=on-failure
 RestartSec=5
@@ -353,6 +433,9 @@ EOF
 # 备份与恢复
 #===============================================================================
 backup_config() {
+    # 清理 30 天前的旧备份
+    find "${CONF_DIR}" -maxdepth 1 -name "*.bak.*" -mtime +30 -delete 2>/dev/null || true
+
     if [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
         local conf_bak
         conf_bak="${CONF_DIR}/snell-server.conf.bak.$(date +%s).${RANDOM}"
@@ -372,10 +455,8 @@ backup_config() {
 # 随机生成器 (纯 Bash + /dev/urandom)
 #===============================================================================
 random_port() {
-    local range=$((RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1))
-    local rand
-    rand=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
-    echo "$((RANDOM_PORT_MIN + rand % range))"
+    shuf -i "${RANDOM_PORT_MIN}-${RANDOM_PORT_MAX}" -n 1 2>/dev/null || \
+        od -An -N2 -tu2 /dev/urandom | tr -d ' ' | awk -v min="${RANDOM_PORT_MIN}" -v max="${RANDOM_PORT_MAX}" '{print min + ($1 % (max - min + 1))}'
 }
 
 random_psk() {
@@ -404,8 +485,9 @@ validate_psk() {
         log_error "PSK 不能为空"
         return 1
     fi
-    if [[ ! "$psk" =~ ^[A-Za-z0-9@#\$%^\&*+=_-]+$ ]]; then
-        log_error "PSK 包含非法字符，仅允许字母、数字及 @#\$%^\&*+=_-"
+    # 仅允许安全的字符集，避免 Bash 元字符问题
+    if [[ ! "$psk" =~ ^[A-Za-z0-9@+-]+$ ]]; then
+        log_error "PSK 包含非法字符，仅允许字母、数字及 @+ -"
         return 1
     fi
     return 0
@@ -452,7 +534,8 @@ find_nologin_shell() {
             return 0
         fi
     done
-    echo "/bin/false"
+    log_error "未找到任何可用的 nologin shell"
+    return 1
 }
 
 create_snell_user() {
@@ -499,6 +582,11 @@ install_snell() {
     local udp
     local ipv6
     local dns
+
+    # 注册回滚信号处理
+    trap_rollback
+    # 创建预安装备份
+    create_pre_install_backup
 
     os=$(detect_os)
     arch=$(detect_arch)
@@ -583,12 +671,17 @@ install_snell() {
         fi
     fi
 
-    install_deps "${os}"
+    if ! install_deps "${os}"; then
+        log_error "依赖安装失败，请检查网络或手动安装后重试"
+        log_error "需要: wget curl unzip iptables"
+        exit 1
+    fi
 
     local tmp_file
     local tmp_dir
     tmp_file=$(mktemp)
-    tmp_dir=$(mktemp -d)
+    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
+    chmod 700 "${tmp_dir}"
     trap 'rm -f "${tmp_file}"; rm -rf "${tmp_dir}"' EXIT ERR
 
     download_snell "${arch}" "${tmp_file}"
@@ -596,7 +689,9 @@ install_snell() {
 
     rm -f "${tmp_file}"
     rm -rf "${tmp_dir}"
-    trap - EXIT ERR
+    trap - EXIT
+    # 注册成功退出清理
+    trap_cleanup
 
     create_snell_user "${os}"
 
@@ -615,7 +710,7 @@ install_snell() {
     fi
 
     sleep "${SERVICE_VERIFY_SLEEP}"
-    if systemctl is-active --quiet snell; then
+    if is_service_active; then
         log_info "Snell 服务运行正常"
     else
         log_error "Snell 服务未运行"
@@ -647,7 +742,9 @@ EOF
     echo -e "${CYAN}============================================${RESET}"
     echo -e "  服务器IP: ${ip}"
     echo -e "  端口:     ${port}"
-    echo -e "  PSK:      ${psk}"
+    # PSK 用掩码显示，只显示前4位和后4位
+    local psk_masked="${psk:0:4}...${psk: -4}"
+    echo -e "  PSK:      ${psk_masked}"
     echo -e "  IPv6:     ${ipv6}"
     echo -e "  UDP:      ${udp}"
     [[ -n "$obfs" ]] && echo -e "  OBFS:     ${obfs}"
@@ -660,7 +757,7 @@ EOF
     echo -e "Surge 配置路径: ${CONF_DIR}/surge-config.txt"
     echo -e "管理命令: systemctl {start|stop|restart|status} snell"
     echo -e "查看日志: journalctl -u snell -f"
-    echo -e "${YELLOW}注意: 请妥善保管 PSK，不要在公共日志中记录。${RESET}"
+    echo -e "${YELLOW}注意: 请妥善保管 PSK，完整 PSK 已在配置文件中。${RESET}"
     echo ""
 }
 
@@ -690,7 +787,11 @@ update_snell() {
         exit 1
     fi
 
-    systemctl stop snell || true
+    if systemctl stop snell 2>/dev/null; then
+        log_info "服务已停止"
+    else
+        log_warn "服务停止失败或未运行，继续更新..."
+    fi
     deploy_binary "${tmp_file}"
 
     rm -f "${tmp_file}"
@@ -706,7 +807,7 @@ update_snell() {
     fi
 
     sleep "${SERVICE_VERIFY_SLEEP}"
-    if systemctl is-active --quiet snell; then
+    if is_service_active; then
         log_info "服务运行正常"
     else
         log_error "服务未正常启动"
@@ -755,7 +856,9 @@ uninstall_snell() {
     rm -f "${SNELL_DIR}/snell-server"
     rm -rf "${CONF_DIR}"
     rm -f /etc/sysctl.d/99-bbr.conf
-    userdel snell 2>/dev/null || true
+    if id "snell" &>/dev/null; then
+        userdel snell 2>/dev/null || log_warn "删除 snell 用户失败（可能仍有进程使用）"
+    fi
     log_info "Snell 已卸载"
 }
 
@@ -777,7 +880,7 @@ show_menu() {
     if [[ -f "${SNELL_DIR}/snell-server" ]]; then
         installed="已安装"
         ver=$("${SNELL_DIR}/snell-server" -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "未知")
-        systemctl is-active --quiet snell 2>/dev/null && running="运行中" || running="已停止"
+        is_service_active && running="运行中" || running="已停止"
     fi
 
     echo ""
@@ -799,6 +902,9 @@ show_menu() {
     echo "  5. 查看 Snell 配置"
     echo "  0. 退出"
     echo -e "${GREEN}=============================================${RESET}"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        echo -e "${YELLOW}[DRY-RUN 模式]${RESET}"
+    fi
     read -rp "请选择 [0-5]: " choice
 }
 
@@ -812,11 +918,89 @@ quick_install() {
 #===============================================================================
 # 主入口
 #===============================================================================
+# 日志写入文件（所有日志同时输出到 stderr）
+init_logging() {
+    if [[ -w "${LOG_FILE}" ]] || [[ -w "$(dirname "${LOG_FILE}")" ]]; then
+        exec 3>>"${LOG_FILE}"
+    else
+        exec 3>/dev/null
+    fi
+}
+
+# 回滚函数
+rollback() {
+    if [[ "$ROLLBACK_REQUIRED" -eq 0 ]]; then
+        return 0
+    fi
+    log_warn "执行回滚操作..." >&2
+
+    if [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]]; then
+        # 恢复配置文件
+        if [[ -f "${SNELL_BACKUP_DIR}/snell-server.conf" ]]; then
+            cp -p "${SNELL_BACKUP_DIR}/snell-server.conf" "${CONF_DIR}/" 2>/dev/null || true
+        fi
+        if [[ -f "${SNELL_BACKUP_DIR}/snell-server" ]]; then
+            mkdir -p "${SNELL_DIR}"
+            cp -p "${SNELL_BACKUP_DIR}/snell-server" "${SNELL_DIR}/" 2>/dev/null || true
+        fi
+        if [[ -f "${SNELL_BACKUP_DIR}/snell.service" ]]; then
+            cp -p "${SNELL_BACKUP_DIR}/snell.service" "${SERVICE_FILE}" 2>/dev/null || true
+        fi
+        log_info "配置已回滚" >&2
+    fi
+
+    # 清理备份目录
+    [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]] && rm -rf "${SNELL_BACKUP_DIR}"
+    ROLLBACK_REQUIRED=0
+}
+
+# 清理备份（安装成功后）
+cleanup_backup() {
+    if [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]]; then
+        rm -rf "${SNELL_BACKUP_DIR}"
+    fi
+    ROLLBACK_REQUIRED=0
+}
+
+# 注册信号处理回滚
+trap_rollback() {
+    trap 'rollback; exit 130' INT TERM
+}
+
+# 注册成功退出清理
+trap_cleanup() {
+    trap 'cleanup_backup; exit 0' EXIT
+}
+
+# 创建安装前备份（用于回滚）
+create_pre_install_backup() {
+    if [[ -f "${SNELL_DIR}/snell-server" ]] || [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
+        SNELL_BACKUP_DIR=$(mktemp -d -p /tmp/easysnell-backup.XXXXXX)
+        chmod 700 "${SNELL_BACKUP_DIR}"
+        [[ -f "${SNELL_DIR}/snell-server" ]] && cp -p "${SNELL_DIR}/snell-server" "${SNELL_BACKUP_DIR}/"
+        [[ -f "${CONF_DIR}/snell-server.conf" ]] && cp -p "${CONF_DIR}/snell-server.conf" "${SNELL_BACKUP_DIR}/"
+        [[ -f "${SERVICE_FILE}" ]] && cp -p "${SERVICE_FILE}" "${SNELL_BACKUP_DIR}/"
+        ROLLBACK_REQUIRED=1
+    fi
+}
+
 main() {
+    init_logging
     check_root
     check_systemd
 
+    # Dry-run 模式检测
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        log_info "[DRY-RUN] 模拟执行模式，不会进行任何实际更改"
+    fi
+
     case "${1:-}" in
+        --dry-run|dry-run)
+            DRY_RUN=1
+            log_info "Dry-run 模式: 仅显示将执行的操作"
+            log_info "使用 DRY_RUN=1 bash easysnell.sh --dry-run ..."
+            exit 0
+            ;;
         -q|--quick|quick)
             quick_install
             exit 0
@@ -915,7 +1099,7 @@ main() {
                 ;;
             3)
                 if [[ -f "${SNELL_DIR}/snell-server" ]]; then
-                    if systemctl is-active --quiet snell 2>/dev/null; then
+                    if is_service_active; then
                         systemctl stop snell && log_info "已停止" || log_error "停止失败"
                     else
                         systemctl start snell && log_info "已启动" || log_error "启动失败"
