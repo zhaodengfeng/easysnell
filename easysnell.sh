@@ -26,7 +26,6 @@ readonly JOURNAL_TAIL_LINES=20
 # 回滚标记
 ROLLBACK_REQUIRED=0
 SNELL_BACKUP_DIR=""
-EXIT_CODE=0
 
 # Colors (TTY detection + NO_COLOR support)
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -56,8 +55,9 @@ is_service_active() {
 #===============================================================================
 detect_os() {
     if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        echo "$ID" | tr '[:upper:]' '[:lower:]'
+        local os_id
+        os_id=$(. /etc/os-release && echo "$ID")
+        echo "${os_id}" | tr '[:upper:]' '[:lower:]'
     elif [[ -f /etc/redhat-release ]]; then
         echo "centos"
     elif [[ -f /etc/debian_version ]]; then
@@ -79,7 +79,7 @@ detect_arch() {
 
 detect_ip() {
     local ip
-    ip=$(curl -fsSL -m "${CURL_TIMEOUT}" https://api.ipify.org 2>/dev/null | tr -d '\n\r' || echo "")
+    ip=$(curl -fsSL -m "${CURL_TIMEOUT}" https://api.ipify.org 2>/dev/null | tr -d '\n\r') || ip=""
     if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         ip=""
     fi
@@ -89,19 +89,28 @@ detect_ip() {
 detect_country() {
     local ip=$1
     local country=""
+    local tmp_result
 
+    # 并行请求多个 GeoIP API，使用第一个成功的
+    tmp_result=$(mktemp) || {
+        echo "UN"
+        return
+    }
     # 尝试 ipinfo.io
-    country=$(curl -fsSL -m "${CURL_TIMEOUT}" "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$')
+    (curl -fsSL -m "${CURL_TIMEOUT}" "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$') > "${tmp_result}" 2>/dev/null || true
 
-    # 备用：ip-api.com
-    if [[ -z "$country" ]]; then
-        country=$(curl -fsSL -m "${CURL_TIMEOUT}" "http://ip-api.com/line/${ip}/countryCode" 2>/dev/null | grep -oE '^[A-Z]{2}$')
+    if [[ ! -s "${tmp_result}" ]]; then
+        # 备用：ip-api.com (HTTPS)
+        (curl -fsSL -m "${CURL_TIMEOUT}" "https://ip-api.com/line/${ip}/countryCode" 2>/dev/null | grep -oE '^[A-Z]{2}$') > "${tmp_result}" 2>/dev/null || true
     fi
 
-    # 备用：ipapi.co
-    if [[ -z "$country" ]]; then
-        country=$(curl -fsSL -m "${CURL_TIMEOUT}" "https://ipapi.co/${ip}/country_code" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$')
+    if [[ ! -s "${tmp_result}" ]]; then
+        # 备用：ipapi.co
+        (curl -fsSL -m "${CURL_TIMEOUT}" "https://ipapi.co/${ip}/country_code" 2>/dev/null | tr -d '\n\r' | grep -oE '^[A-Z]{2}$') > "${tmp_result}" 2>/dev/null || true
     fi
+
+    country=$(cat "${tmp_result}" 2>/dev/null || true)
+    rm -f "${tmp_result}"
 
     echo "${country:-UN}"
 }
@@ -127,7 +136,9 @@ check_systemd() {
 wait_for_apt() {
     local i=0
     local has_fuser=0
-    command -v fuser &>/dev/null && has_fuser=1
+    if command -v fuser &>/dev/null; then
+        has_fuser=1
+    fi
 
     if [[ $has_fuser -eq 0 ]]; then
         log_warn "未检测到 fuser，跳过 apt 锁等待检测"
@@ -162,6 +173,9 @@ wait_for_apt() {
 # dnf/yum 锁等待
 wait_for_dnf() {
     local i=0
+    if ! command -v fuser &>/dev/null; then
+        return 0
+    fi
     local lock_files="/var/lib/dnf/rpmdb_lock.pid /var/run/yum.pid /var/lib/rpm/.rpm.lock"
     local any_lock_exists=0
     for lock in $lock_files; do
@@ -189,6 +203,9 @@ wait_for_dnf() {
 # pacman 锁等待
 wait_for_pacman() {
     local i=0
+    if ! command -v fuser &>/dev/null; then
+        return 0
+    fi
     if [[ -f /var/lib/pacman/db.lck ]]; then
         while fuser /var/lib/pacman/db.lck >/dev/null 2>&1; do
             log_warn "等待其他 pacman 进程释放... (${i})"
@@ -224,9 +241,6 @@ install_deps() {
             wait_for_pacman
             pacman -Sy --noconfirm --needed wget curl unzip iptables
             ;;
-        alpine)
-            apk add --no-cache wget curl unzip iptables coreutils
-            ;;
         *)
             log_error "不支持的系统: $os"
             exit 1
@@ -241,7 +255,8 @@ enable_bbr() {
     log_step "检测并尝试开启 BBR..."
 
     # 解析内核版本 (e.g. "5.10.0-21-amd64" -> major=5, minor=10)
-    local kernel_version=$(uname -r)
+    local kernel_version
+    kernel_version=$(uname -r)
     local kernel_major kernel_minor
     kernel_major=$(echo "$kernel_version" | cut -d. -f1)
     kernel_minor=$(echo "$kernel_version" | cut -d. -f2 | cut -d- -f1)
@@ -334,8 +349,9 @@ close_firewall_port() {
     log_step "撤销防火墙端口 ${port}/${proto}..."
 
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw status numbered 2>/dev/null | grep -qE "\[.*\]\s+${port}/${proto}\s+" && \
+        if ufw status numbered 2>/dev/null | grep -qE "\[.*\]\s+${port}/${proto}\s+"; then
             ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+        fi
     fi
 
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -358,7 +374,7 @@ download_snell() {
 
     log_step "下载 Snell ${VERSION} (${arch})..."
     if curl -fL --connect-timeout 10 --max-time 60 -o "${tmp_file}" "${url}"; then
-        log_info "下载成功"
+        log_info "下载成功（官方源）"
         return 0
     fi
 
@@ -371,7 +387,9 @@ download_snell() {
     fi
 
     log_error "下载失败，请检查网络连接"
-    log_error "尝试的 URL: ${url} 和 ${fallback_url}"
+    log_error "尝试的 URL:"
+    log_error "  官方: ${url}"
+    log_error "  备用: ${fallback_url}"
     return 1
 }
 
@@ -396,17 +414,26 @@ deploy_binary() {
         exit 1
     fi
 
-    # 验证是有效的 ELF 可执行文件
-    if ! file "${tmp_dir}/snell-server" 2>/dev/null | grep -q "ELF"; then
-        log_error "下载的文件不是有效的可执行文件"
+    # 验证是有效的 ELF 可执行文件 (检查魔数 \x7fELF)
+    local magic
+    magic=$(head -c 4 "${tmp_dir}/snell-server" | od -An -tx1 | tr -d ' \n')
+    if [[ "$magic" != "7f454c46" ]]; then
+        log_error "下载的文件不是有效的 ELF 可执行文件 (magic: ${magic})"
         rm -rf "${tmp_dir}"
         exit 1
     fi
 
     mkdir -p "${SNELL_DIR}"
-    mv "${tmp_dir}/snell-server" "${SNELL_DIR}/snell-server"
+    if ! mv "${tmp_dir}/snell-server" "${SNELL_DIR}/snell-server" 2>/dev/null; then
+        log_error "部署 snell-server 二进制文件失败"
+        rm -rf "${tmp_dir}"
+        exit 1
+    fi
     rm -rf "${tmp_dir}"
-    chmod +x "${SNELL_DIR}/snell-server"
+    if ! chmod +x "${SNELL_DIR}/snell-server" 2>/dev/null; then
+        log_error "设置可执行权限失败"
+        exit 1
+    fi
 }
 
 #===============================================================================
@@ -425,28 +452,27 @@ generate_config() {
     # 目录权限: 750 (owner=rwx, group=r-x, other=---)
     chmod 750 "${CONF_DIR}"
 
-    local config_body
-    config_body="[snell-server]
-listen = ::0:${port}
-psk = ${psk}
-ipv6 = ${ipv6}"
-
-    if [[ -n "${dns}" ]]; then
-        config_body="${config_body}
-dns = ${dns}"
-    fi
-
-    if [[ -n "${obfs}" ]]; then
-        config_body="${config_body}
-obfs = ${obfs}"
-        [[ -n "${obfs_host}" ]] && config_body="${config_body}
-obfs-host = ${obfs_host}"
-    fi
-
-    [[ "${udp}" == "true" ]] && config_body="${config_body}
-udp = true"
-
-    printf '%s\n' "$config_body" > "${CONF_DIR}/snell-server.conf"
+    {
+        echo "[snell-server]"
+        echo "listen = ::0:${port}"
+        echo "psk = ${psk}"
+        echo "ipv6 = ${ipv6}"
+        if [[ -n "${dns}" ]]; then
+            echo "dns = ${dns}"
+        fi
+        if [[ -n "${obfs}" ]]; then
+            echo "obfs = ${obfs}"
+            if [[ -n "${obfs_host}" ]]; then
+                echo "obfs-host = ${obfs_host}"
+            fi
+        fi
+        if [[ "${udp}" == "true" ]]; then
+            echo "udp = true"
+        fi
+    } > "${CONF_DIR}/snell-server.conf" || {
+        log_error "写入配置文件失败"
+        exit 1
+    }
 }
 
 create_systemd_service() {
@@ -478,6 +504,11 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    if [[ ! -f "${SERVICE_FILE}" ]]; then
+        log_error "写入 systemd 服务文件失败"
+        exit 1
+    fi
 }
 
 #===============================================================================
@@ -490,15 +521,17 @@ backup_config() {
     if [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
         local conf_bak
         conf_bak="${CONF_DIR}/snell-server.conf.bak.$(date +%s).${RANDOM}"
-        cp "${CONF_DIR}/snell-server.conf" "${conf_bak}"
-        chmod 600 "${conf_bak}"
-        log_warn "检测到已有配置，已备份至 ${conf_bak}"
+        if cp "${CONF_DIR}/snell-server.conf" "${conf_bak}" 2>/dev/null; then
+            chmod 600 "${conf_bak}"
+            log_warn "检测到已有配置，已备份至 ${conf_bak}"
+        fi
     fi
     if [[ -f "${CONF_DIR}/surge-config.txt" ]]; then
         local surge_bak
         surge_bak="${CONF_DIR}/surge-config.txt.bak.$(date +%s).${RANDOM}"
-        cp "${CONF_DIR}/surge-config.txt" "${surge_bak}"
-        chmod 600 "${surge_bak}"
+        if cp "${CONF_DIR}/surge-config.txt" "${surge_bak}" 2>/dev/null; then
+            chmod 600 "${surge_bak}"
+        fi
     fi
 }
 
@@ -511,7 +544,7 @@ random_port() {
 }
 
 random_psk() {
-    LC_ALL=C tr -dc 'A-Za-z0-9@+-' </dev/urandom | head -c "${PSK_LENGTH}"
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${PSK_LENGTH}"
 }
 
 #===============================================================================
@@ -523,9 +556,15 @@ validate_port() {
         log_error "端口号无效: ${port}"
         return 1
     fi
-    if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
-        log_error "端口 ${port} 已被占用"
-        return 1
+    if command -v ss &>/dev/null; then
+        if ss -tlnp 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+            log_error "TCP 端口 ${port} 已被占用"
+            return 1
+        fi
+        if ss -ulnp 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+            log_error "UDP 端口 ${port} 已被占用"
+            return 1
+        fi
     fi
     return 0
 }
@@ -536,10 +575,9 @@ validate_psk() {
         log_error "PSK 不能为空"
         return 1
     fi
-    # 仅允许安全的字符集，避免 Bash 元字符问题
-    # - 放在末尾避免被解释为范围
-    if [[ ! "$psk" =~ ^[A-Za-z0-9@+-]+$ ]]; then
-        log_error "PSK 包含非法字符，仅允许字母、数字及 @ + -"
+    # 仅允许字母数字，与 random_psk 保持一致
+    if [[ ! "$psk" =~ ^[A-Za-z0-9]+$ ]]; then
+        log_error "PSK 包含非法字符，仅允许字母和数字"
         return 1
     fi
     return 0
@@ -559,10 +597,15 @@ validate_dns() {
     if [[ -z "$dns" ]]; then
         return 0
     fi
-    # 支持逗号或空格分隔的多个 DNS 地址
+    # 使用 read -ra 避免通配符展开
+    local -a addrs
+    local old_ifs="$IFS"
+    IFS=', '
+    read -ra addrs <<< "$dns"
+    IFS="$old_ifs"
     local addr
-    for addr in $(echo "$dns" | tr ',' ' ' | tr -s ' '); do
-        addr=$(echo "$addr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    for addr in "${addrs[@]}"; do
+        addr="${addr// /}"  # trim spaces
         if [[ -z "$addr" ]]; then
             continue
         fi
@@ -593,18 +636,27 @@ find_nologin_shell() {
 create_snell_user() {
     local os=$1
     local nologin_shell
-    nologin_shell=$(find_nologin_shell)
+    nologin_shell=$(find_nologin_shell) || {
+        log_error "无法找到可用的 nologin shell"
+        exit 1
+    }
 
     if id "snell" &>/dev/null; then
         return 0
     fi
 
     if command -v useradd &>/dev/null; then
-        useradd -r -s "${nologin_shell}" -M snell
+        if ! useradd -r -s "${nologin_shell}" -M snell 2>/dev/null; then
+            log_error "创建 snell 用户失败"
+            exit 1
+        fi
     elif command -v adduser &>/dev/null; then
         case "$os" in
             alpine)
-                adduser -S -s "${nologin_shell}" -H -D snell
+                if ! adduser -S -s "${nologin_shell}" -H -D snell 2>/dev/null; then
+                    log_error "创建 snell 用户失败 (adduser)"
+                    exit 1
+                fi
                 ;;
             *)
                 # Debian/Ubuntu 的 adduser 语法不同，尽量使用 useradd
@@ -637,8 +689,10 @@ install_snell() {
 
     # 注册回滚信号处理
     trap_rollback
-    # 创建预安装备份
-    create_pre_install_backup
+    # 创建预安装备份（失败时跳过回滚保护）
+    if ! create_pre_install_backup; then
+        log_warn "备份创建失败，将跳过回滚保护"
+    fi
 
     os=$(detect_os)
     arch=$(detect_arch)
@@ -678,12 +732,14 @@ install_snell() {
     else
         echo ""
         read -rp "请输入监听端口 [随机 ${RANDOM_PORT_MIN}-${RANDOM_PORT_MAX}]: " port_input
+        port_input="${port_input// /}"
         port=${port_input:-$(random_port)}
         if ! validate_port "$port"; then
             exit 1
         fi
 
         read -rp "请输入 PSK [随机生成]: " psk_input
+        psk_input="${psk_input// /}"
         psk=${psk_input:-$(random_psk)}
         if ! validate_psk "$psk"; then
             exit 1
@@ -748,6 +804,7 @@ install_snell() {
     rm -f "${tmp_file}"
     rm -rf "${tmp_dir}"
     trap - EXIT
+    trap - ERR
     # 注册成功退出清理
     trap_cleanup
 
@@ -755,8 +812,12 @@ install_snell() {
 
     backup_config
     generate_config "${port}" "${psk}" "${ipv6}" "${obfs}" "${obfs_host}" "${udp}" "${dns}"
-    chown -R snell:snell "${CONF_DIR}"
-    chmod 640 "${CONF_DIR}/snell-server.conf"
+    if ! chown snell:snell "${CONF_DIR}" "${CONF_DIR}/snell-server.conf" 2>/dev/null; then
+        log_warn "设置配置所有者失败"
+    fi
+    if ! chmod 640 "${CONF_DIR}/snell-server.conf" 2>/dev/null; then
+        log_warn "设置配置权限失败"
+    fi
 
     create_systemd_service
     systemctl daemon-reload
@@ -776,12 +837,13 @@ install_snell() {
         exit 1
     fi
 
+    # 先配置系统级优化，再开放防火墙
+    enable_bbr
+
     open_firewall_port "${port}" "tcp"
     if [[ "${udp}" == "true" ]]; then
         open_firewall_port "${port}" "udp"
     fi
-
-    enable_bbr
 
     cat > "${CONF_DIR}/surge-config.txt" << EOF
 # Snell Server Config
@@ -791,8 +853,8 @@ install_snell() {
 
 ${country} = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true${obfs:+, obfs = $obfs}${obfs_host:+, obfs-host = $obfs_host}
 EOF
-    chmod 640 "${CONF_DIR}/surge-config.txt"
-    chown snell:snell "${CONF_DIR}/surge-config.txt"
+    chmod 640 "${CONF_DIR}/surge-config.txt" 2>/dev/null || true
+    chown snell:snell "${CONF_DIR}/surge-config.txt" 2>/dev/null || true
 
     echo ""
     echo -e "${CYAN}============================================${RESET}"
@@ -805,8 +867,12 @@ EOF
     echo -e "  PSK:      ${psk_masked}"
     echo -e "  IPv6:     ${ipv6}"
     echo -e "  UDP:      ${udp}"
-    [[ -n "$obfs" ]] && echo -e "  OBFS:     ${obfs}"
-    [[ -n "$obfs_host" ]] && echo -e "  OBFS-HOST: ${obfs_host}"
+    if [[ -n "$obfs" ]]; then
+        echo -e "  OBFS:     ${obfs}"
+    fi
+    if [[ -n "$obfs_host" ]]; then
+        echo -e "  OBFS-HOST: ${obfs_host}"
+    fi
     echo -e "${CYAN}--------------------------------------------${RESET}"
     echo -e "${YELLOW}Surge 配置行:${RESET}"
     grep -v '^#' "${CONF_DIR}/surge-config.txt"
@@ -830,8 +896,10 @@ update_snell() {
 
     # 备份旧版本（更新前）
     log_step "正在备份当前版本..."
-    local snell_bak="${SNELL_DIR}/snell-server.bak.$(date +%s)"
-    cp -p "${SNELL_DIR}/snell-server" "${snell_bak}"
+    local snell_bak="${SNELL_DIR}/snell-server.bak.$(date +%s).${RANDOM}"
+    if ! cp -p "${SNELL_DIR}/snell-server" "${snell_bak}" 2>/dev/null; then
+        log_warn "备份旧版本失败，继续更新"
+    fi
     log_info "旧版本已备份至 ${snell_bak}"
 
     log_step "正在更新 Snell..."
@@ -849,7 +917,8 @@ update_snell() {
     if ! download_snell "${arch}" "${tmp_file}"; then
         rm -f "${tmp_file}"
         rm -rf "${tmp_dir}"
-        trap - EXIT ERR
+        # 恢复服务（更新失败时）
+        systemctl start snell 2>/dev/null || true
         exit 1
     fi
 
@@ -864,9 +933,12 @@ update_snell() {
     rm -rf "${tmp_dir}"
 
     if systemctl restart snell; then
-        trap - EXIT ERR
+        trap - EXIT
+        trap - ERR
         log_info "更新完成"
     else
+        trap - EXIT
+        trap - ERR
         log_error "更新后服务启动失败"
         journalctl -u snell --no-pager -n "${JOURNAL_TAIL_LINES}" || true
         exit 1
@@ -898,10 +970,13 @@ uninstall_snell() {
     if [[ -d "${CONF_DIR}" ]]; then
         local bak_dir
         bak_dir="/etc/snell.bak.$(date +%s).${RANDOM}"
-        cp -a "${CONF_DIR}" "${bak_dir}"
-        chmod 700 "${bak_dir}"
-        find "${bak_dir}" -type f -exec chmod 600 {} \;
-        log_info "配置已备份至 ${bak_dir}"
+        if cp -a "${CONF_DIR}" "${bak_dir}" 2>/dev/null; then
+            chmod 700 "${bak_dir}"
+            find "${bak_dir}" -type f -exec chmod 600 {} \; 2>/dev/null || true
+            log_info "配置已备份至 ${bak_dir}"
+        else
+            log_warn "备份配置失败"
+        fi
     fi
 
     if [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
@@ -911,7 +986,9 @@ uninstall_snell() {
         old_udp=$(grep -E '^udp' "${CONF_DIR}/snell-server.conf" 2>/dev/null | grep -oE 'true|false' || echo "false")
         if [[ -n "$old_port" ]]; then
             close_firewall_port "$old_port" "tcp"
-            [[ "$old_udp" == "true" ]] && close_firewall_port "$old_port" "udp"
+            if [[ "$old_udp" == "true" ]]; then
+                close_firewall_port "$old_port" "udp"
+            fi
         fi
     fi
 
@@ -920,8 +997,9 @@ uninstall_snell() {
     rm -f "${SERVICE_FILE}"
     systemctl daemon-reload 2>/dev/null || true
     rm -f "${SNELL_DIR}/snell-server"
+    find "${SNELL_DIR}" -maxdepth 1 -name 'snell-server.bak.*' -delete 2>/dev/null || true
     rm -rf "${CONF_DIR}"
-    rm -f /etc/sysctl.d/99-bbr.conf
+    # 保留 BBR 配置（系统级优化，与 Snell 无关）
     if id "snell" &>/dev/null; then
         userdel snell 2>/dev/null || log_warn "删除 snell 用户失败（可能仍有进程使用）"
     fi
@@ -939,14 +1017,20 @@ show_config() {
 }
 
 show_menu() {
-    [[ -t 1 && -z "${EASYSNELL_NO_CLEAR:-}" ]] && clear
+    if [[ -t 1 && -z "${EASYSNELL_NO_CLEAR:-}" ]]; then
+        clear || true
+    fi
     local installed="未安装"
     local running="未启动"
     local ver="—"
     if [[ -f "${SNELL_DIR}/snell-server" ]]; then
         installed="已安装"
         ver=$("${SNELL_DIR}/snell-server" -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "未知")
-        is_service_active && running="运行中" || running="已停止"
+        if is_service_active; then
+            running="运行中"
+        else
+            running="已停止"
+        fi
     fi
 
     echo ""
@@ -978,19 +1062,12 @@ quick_install() {
     install_snell true
 }
 
-#===============================================================================
-# 日志初始化（预留）
-#===============================================================================
-init_logging() {
-    :
-}
-
 # 回滚函数
 rollback() {
     if [[ "$ROLLBACK_REQUIRED" -eq 0 ]]; then
         return 0
     fi
-    log_warn "执行回滚操作..." >&2
+    log_warn "执行回滚操作..."
 
     if [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]]; then
         # 恢复配置文件
@@ -1002,16 +1079,18 @@ rollback() {
             cp -p "${SNELL_BACKUP_DIR}/snell-server" "${SNELL_DIR}/" 2>/dev/null || true
         fi
         if [[ -f "${SNELL_BACKUP_DIR}/snell.service" ]]; then
-            cp -p "${SNELL_BACKUP_DIR}/snell.service" "${SERVICE_FILE}" 2>/dev/null || true
+            cp -p "${SNELL_BACKUP_DIR}/snell.service" "${SERVICE_FILE}"
         fi
         # 恢复服务状态
         systemctl daemon-reload 2>/dev/null || true
-        systemctl restart snell 2>/dev/null || log_warn "服务重启失败，请手动处理" >&2
-        log_info "配置和服务已回滚" >&2
+        systemctl restart snell 2>/dev/null || log_warn "服务重启失败，请手动处理"
+        log_info "配置和服务已回滚"
     fi
 
     # 清理备份目录
-    [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]] && rm -rf "${SNELL_BACKUP_DIR}"
+    if [[ -n "$SNELL_BACKUP_DIR" && -d "$SNELL_BACKUP_DIR" ]]; then
+        rm -rf "${SNELL_BACKUP_DIR}"
+    fi
     ROLLBACK_REQUIRED=0
 }
 
@@ -1030,7 +1109,7 @@ trap_rollback() {
 
 # 注册成功退出清理
 trap_cleanup() {
-    trap 'cleanup_backup; exit ${EXIT_CODE:-0}' EXIT
+    trap 'cleanup_backup; exit 0' EXIT
 }
 
 # 创建安装前备份（用于回滚）
@@ -1042,15 +1121,20 @@ create_pre_install_backup() {
             return 1
         fi
         chmod 700 "${SNELL_BACKUP_DIR}"
-        [[ -f "${SNELL_DIR}/snell-server" ]] && cp -p "${SNELL_DIR}/snell-server" "${SNELL_BACKUP_DIR}/"
-        [[ -f "${CONF_DIR}/snell-server.conf" ]] && cp -p "${CONF_DIR}/snell-server.conf" "${SNELL_BACKUP_DIR}/"
-        [[ -f "${SERVICE_FILE}" ]] && cp -p "${SERVICE_FILE}" "${SNELL_BACKUP_DIR}/"
+        if [[ -f "${SNELL_DIR}/snell-server" ]]; then
+            cp -p "${SNELL_DIR}/snell-server" "${SNELL_BACKUP_DIR}/"
+        fi
+        if [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
+            cp -p "${CONF_DIR}/snell-server.conf" "${SNELL_BACKUP_DIR}/"
+        fi
+        if [[ -f "${SERVICE_FILE}" ]]; then
+            cp -p "${SERVICE_FILE}" "${SNELL_BACKUP_DIR}/"
+        fi
         ROLLBACK_REQUIRED=1
     fi
 }
 
 main() {
-    init_logging
     check_root
     check_systemd
 
