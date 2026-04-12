@@ -283,6 +283,7 @@ generate_config() {
     local obfs=${4:-}
     local obfs_host=${5:-}
     local udp=${6:-true}
+    local dns=${7:-}
 
     mkdir -p "${CONF_DIR}"
 
@@ -291,6 +292,11 @@ generate_config() {
 listen = ::0:${port}
 psk = ${psk}
 ipv6 = ${ipv6}"
+
+    if [[ -n "${dns}" ]]; then
+        config_body="${config_body}
+dns = ${dns}"
+    fi
 
     if [[ -n "${obfs}" ]]; then
         config_body="${config_body}
@@ -414,6 +420,28 @@ validate_obfs_host() {
     return 0
 }
 
+validate_dns() {
+    local dns=$1
+    if [[ -z "$dns" ]]; then
+        return 0
+    fi
+    # 支持逗号或空格分隔的多个 DNS 地址
+    local addr
+    for addr in $(echo "$dns" | tr ',' ' ' | tr -s ' '); do
+        addr=$(echo "$addr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$addr" ]]; then
+            continue
+        fi
+        # IPv4 或 IPv6 基础校验
+        if [[ ! "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+           [[ ! "$addr" =~ ^[0-9a-fA-F:]+$ ]]; then
+            log_error "非法的 DNS 地址: ${addr}"
+            return 1
+        fi
+    done
+    return 0
+}
+
 #===============================================================================
 # 用户创建
 #===============================================================================
@@ -470,6 +498,7 @@ install_snell() {
     local obfs_host
     local udp
     local ipv6
+    local dns
 
     os=$(detect_os)
     arch=$(detect_arch)
@@ -499,6 +528,7 @@ install_snell() {
         udp="true"
         obfs=""
         obfs_host=""
+        dns="1.1.1.1, 8.8.8.8"
     else
         echo ""
         read -rp "请输入监听端口 [随机 ${RANDOM_PORT_MIN}-${RANDOM_PORT_MAX}]: " port_input
@@ -545,6 +575,12 @@ install_snell() {
                 fi
             fi
         fi
+
+        read -rp "请输入 DNS 服务器地址 [1.1.1.1, 8.8.8.8]: " dns_input
+        dns=${dns_input:-1.1.1.1, 8.8.8.8}
+        if ! validate_dns "$dns"; then
+            exit 1
+        fi
     fi
 
     install_deps "${os}"
@@ -565,7 +601,7 @@ install_snell() {
     create_snell_user "${os}"
 
     backup_config
-    generate_config "${port}" "${psk}" "${ipv6}" "${obfs}" "${obfs_host}" "${udp}"
+    generate_config "${port}" "${psk}" "${ipv6}" "${obfs}" "${obfs_host}" "${udp}" "${dns}"
     chown -R snell:snell "${CONF_DIR}"
     chmod 640 "${CONF_DIR}/snell-server.conf"
 

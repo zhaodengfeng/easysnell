@@ -13,6 +13,7 @@
 - **systemd 专用**：针对现代 Linux 发行版优化（要求 systemd）
 - **自动防火墙**：自动放行 ufw / firewalld / iptables 端口
 - **BBR 加速**：内核 5.0+ 自动开启 BBR 网络优化
+- **自定义 DNS**：支持配置多个 DNS 服务器地址
 - **配置备份**：重新安装时自动备份旧配置，防止误覆盖
 - **非交互模式**：支持 `-q/--quick` 自动化部署
 - **完整 CLI**：安装、更新、卸载、启停、查看配置一键完成
@@ -127,6 +128,7 @@ cat /etc/snell/surge-config.txt
 listen = ::0:44321
 psk = x7k9mP2qR5sL8vN4wJ6yZ
 ipv6 = true
+dns = 1.1.1.1, 8.8.8.8
 udp = true
 obfs = tls
 obfs-host = bing.com
