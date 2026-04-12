@@ -18,20 +18,15 @@ readonly RANDOM_PORT_MIN=30000
 readonly RANDOM_PORT_MAX=65000
 readonly PSK_LENGTH=24
 readonly CURL_TIMEOUT=5
-readonly APT_LOCK_WAIT_MAX=60
+readonly APT_LOCK_WAIT_CYCLES=30  # 30 cycles × 2s = 60s max
 readonly LIMIT_NOFILE=32768
 readonly SERVICE_VERIFY_SLEEP=2
 readonly JOURNAL_TAIL_LINES=20
 
-# 日志文件
-readonly LOG_FILE="${EASYSNELL_LOG:-/var/log/easysnell.log}"
-
-# Dry-run 模式（预留）
-# DRY_RUN="${DRY_RUN:-0}"
-
 # 回滚标记
 ROLLBACK_REQUIRED=0
 SNELL_BACKUP_DIR=""
+EXIT_CODE=0
 
 # Colors (TTY detection + NO_COLOR support)
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -53,7 +48,7 @@ log_step()  { printf '%b[STEP]%b  %s\n' "$BLUE" "$RESET" "$@" >&2; }
 
 # Service status helper
 is_service_active() {
-    systemctl is-active --quiet snell 2>/dev/null
+    timeout 10 systemctl is-active --quiet snell 2>/dev/null
 }
 
 #===============================================================================
@@ -157,11 +152,54 @@ wait_for_apt() {
         log_warn "等待其他 apt 进程释放... (${i})"
         sleep 2
         i=$((i + 1))
-        if [[ $i -gt APT_LOCK_WAIT_MAX ]]; then
+        if [[ $i -gt APT_LOCK_WAIT_CYCLES ]]; then
             log_error "apt 锁等待超时"
             exit 1
         fi
     done
+}
+
+# dnf/yum 锁等待
+wait_for_dnf() {
+    local i=0
+    local lock_files="/var/lib/dnf/rpmdb_lock.pid /var/run/yum.pid /var/lib/rpm/.rpm.lock"
+    local any_lock_exists=0
+    for lock in $lock_files; do
+        if [[ -f "$lock" ]]; then
+            any_lock_exists=1
+            break
+        fi
+    done
+
+    if [[ $any_lock_exists -eq 0 ]]; then
+        return 0
+    fi
+
+    while fuser $lock_files >/dev/null 2>&1; do
+        log_warn "等待其他 dnf 进程释放... (${i})"
+        sleep 2
+        i=$((i + 1))
+        if [[ $i -gt APT_LOCK_WAIT_CYCLES ]]; then
+            log_error "dnf/yum 锁等待超时"
+            exit 1
+        fi
+    done
+}
+
+# pacman 锁等待
+wait_for_pacman() {
+    local i=0
+    if [[ -f /var/lib/pacman/db.lck ]]; then
+        while fuser /var/lib/pacman/db.lck >/dev/null 2>&1; do
+            log_warn "等待其他 pacman 进程释放... (${i})"
+            sleep 2
+            i=$((i + 1))
+            if [[ $i -gt APT_LOCK_WAIT_CYCLES ]]; then
+                log_error "pacman 锁等待超时"
+                exit 1
+            fi
+        done
+    fi
 }
 
 install_deps() {
@@ -171,23 +209,23 @@ install_deps() {
         debian|ubuntu)
             wait_for_apt
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq 2>&1 | grep -v "^Fetched" || true
-            if ! apt-get install -y -qq wget curl unzip iptables ip6tables 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking"; then
-                :  # 静默安装成功
-            fi
+            apt-get update -qq
+            apt-get install -y -qq wget curl unzip iptables ip6tables
             ;;
         centos|rhel|almalinux|rocky|fedora)
+            wait_for_dnf
             if command -v dnf &>/dev/null; then
-                dnf -y install wget curl unzip iptables-services 2>&1 | grep -v "^Last metadata" || true
+                dnf -y -q install wget curl unzip iptables-services
             else
-                yum -y install wget curl unzip iptables-services 2>&1 | grep -v "^Package\|^Transaction" || true
+                yum -y -q install wget curl unzip iptables-services
             fi
             ;;
         arch|manjaro)
-            pacman -Sy --noconfirm --needed wget curl unzip iptables 2>&1 | grep -v "^\[.*\]" || true
+            wait_for_pacman
+            pacman -Sy --noconfirm --needed wget curl unzip iptables
             ;;
         alpine)
-            apk add --no-cache wget curl unzip iptables coreutils 2>&1 | grep -v "^fetch" || true
+            apk add --no-cache wget curl unzip iptables coreutils
             ;;
         *)
             log_error "不支持的系统: $os"
@@ -499,8 +537,9 @@ validate_psk() {
         return 1
     fi
     # 仅允许安全的字符集，避免 Bash 元字符问题
+    # - 放在末尾避免被解释为范围
     if [[ ! "$psk" =~ ^[A-Za-z0-9@+-]+$ ]]; then
-        log_error "PSK 包含非法字符，仅允许字母、数字及 @+ -"
+        log_error "PSK 包含非法字符，仅允许字母、数字及 @ + -"
         return 1
     fi
     return 0
@@ -621,7 +660,13 @@ install_snell() {
 
     if [[ "$auto" == "true" ]]; then
         port=$(random_port)
+        local retries=0
         while ! validate_port "$port"; do
+            retries=$((retries + 1))
+            if [[ $retries -gt 10 ]]; then
+                log_error "无法找到可用端口，请手动指定或检查服务器环境"
+                exit 1
+            fi
             port=$(random_port)
         done
         psk=$(random_psk)
@@ -934,11 +979,10 @@ quick_install() {
 }
 
 #===============================================================================
-# 主入口
+# 日志初始化（预留）
 #===============================================================================
-# 日志初始化（目前仅输出到 stderr）
 init_logging() {
-    :  # 未来可扩展为同时写入 LOG_FILE
+    :
 }
 
 # 回滚函数
@@ -960,7 +1004,10 @@ rollback() {
         if [[ -f "${SNELL_BACKUP_DIR}/snell.service" ]]; then
             cp -p "${SNELL_BACKUP_DIR}/snell.service" "${SERVICE_FILE}" 2>/dev/null || true
         fi
-        log_info "配置已回滚" >&2
+        # 恢复服务状态
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl restart snell 2>/dev/null || log_warn "服务重启失败，请手动处理" >&2
+        log_info "配置和服务已回滚" >&2
     fi
 
     # 清理备份目录
@@ -983,13 +1030,17 @@ trap_rollback() {
 
 # 注册成功退出清理
 trap_cleanup() {
-    trap 'cleanup_backup; exit 0' EXIT
+    trap 'cleanup_backup; exit ${EXIT_CODE:-0}' EXIT
 }
 
 # 创建安装前备份（用于回滚）
 create_pre_install_backup() {
     if [[ -f "${SNELL_DIR}/snell-server" ]] || [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
         SNELL_BACKUP_DIR=$(mktemp -d -p /tmp/easysnell-backup.XXXXXX)
+        if [[ -z "$SNELL_BACKUP_DIR" || ! -d "$SNELL_BACKUP_DIR" ]]; then
+            log_error "无法创建备份目录，请检查 /tmp 空间"
+            return 1
+        fi
         chmod 700 "${SNELL_BACKUP_DIR}"
         [[ -f "${SNELL_DIR}/snell-server" ]] && cp -p "${SNELL_DIR}/snell-server" "${SNELL_BACKUP_DIR}/"
         [[ -f "${CONF_DIR}/snell-server.conf" ]] && cp -p "${CONF_DIR}/snell-server.conf" "${SNELL_BACKUP_DIR}/"
@@ -1002,11 +1053,6 @@ main() {
     init_logging
     check_root
     check_systemd
-
-    # Dry-run 模式检测（预留）
-    # if [[ "${DRY_RUN}" == "1" ]]; then
-    #     log_info "[DRY-RUN] 模拟执行模式，不会进行任何实际更改"
-    # fi
 
     case "${1:-}" in
         -q|--quick|quick)
