@@ -10,11 +10,12 @@
 
 - **一键部署**：全自动下载、配置、启动 Snell 服务
 - **跨发行版兼容**：支持 Debian/Ubuntu、CentOS/RHEL/Alma/Rocky/Fedora、Arch/Manjaro
+- **IPv4/IPv6 双栈**：自动检测公网 IP（支持 IPv6-only 环境）
 - **systemd 专用**：针对现代 Linux 发行版优化（要求 systemd）
 - **自动防火墙**：自动放行 ufw / firewalld / iptables 端口
 - **BBR 加速**：内核 5.0+ 自动开启 BBR 网络优化
 - **自定义 DNS**：支持配置多个 DNS 服务器地址
-- **配置备份**：重新安装时自动备份旧配置，防止误覆盖
+- **配置备份与回滚**：安装/更新时自动备份，失败时自动回滚到之前状态
 - **非交互模式**：支持 `-q/--quick` 自动化部署
 - **完整 CLI**：安装、更新、卸载、启停、查看配置一键完成
 

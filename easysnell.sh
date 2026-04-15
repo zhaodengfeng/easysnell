@@ -22,10 +22,41 @@ readonly APT_LOCK_WAIT_CYCLES=30  # 30 cycles × 2s = 60s max
 readonly LIMIT_NOFILE=32768
 readonly SERVICE_VERIFY_SLEEP=2
 readonly JOURNAL_TAIL_LINES=20
+readonly BACKUP_RETAIN_DAYS=30
 
 # 回滚标记
 ROLLBACK_REQUIRED=0
 SNELL_BACKUP_DIR=""
+
+# 全局清理状态
+_CLEANUP_TMP_FILE=""
+_CLEANUP_TMP_DIR=""
+
+# 统一退出处理：根据退出码决定回滚或清理备份
+_on_exit() {
+    local exit_code=$?
+    # 清理临时文件
+    [[ -n "${_CLEANUP_TMP_FILE}" ]] && rm -f "${_CLEANUP_TMP_FILE}" 2>/dev/null || true
+    [[ -n "${_CLEANUP_TMP_DIR}" ]] && rm -rf "${_CLEANUP_TMP_DIR}" 2>/dev/null || true
+    # 根据退出状态决定回滚或清理备份
+    if [[ "${ROLLBACK_REQUIRED}" -eq 1 ]]; then
+        if [[ ${exit_code} -ne 0 ]]; then
+            rollback
+        else
+            cleanup_backup
+        fi
+    fi
+}
+
+_on_signal() {
+    exit 130
+}
+
+# 统一注册信号处理（安装/更新流程共用）
+setup_traps() {
+    trap '_on_exit' EXIT
+    trap '_on_signal' INT TERM
+}
 
 # Colors (TTY detection + NO_COLOR support)
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -79,6 +110,19 @@ detect_arch() {
 
 detect_ip() {
     local ip
+    # 优先使用双栈 API（自动返回 IPv4 或 IPv6）
+    ip=$(curl -fsSL -m "${CURL_TIMEOUT}" https://api64.ipify.org 2>/dev/null | tr -d '\n\r') || ip=""
+    # IPv4 验证
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$ip"
+        return
+    fi
+    # IPv6 验证
+    if [[ -n "$ip" ]] && _is_valid_ip "$ip" && [[ "$ip" == *:* ]]; then
+        echo "$ip"
+        return
+    fi
+    # Fallback: 仅 IPv4
     ip=$(curl -fsSL -m "${CURL_TIMEOUT}" https://api.ipify.org 2>/dev/null | tr -d '\n\r') || ip=""
     if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         ip=""
@@ -91,7 +135,7 @@ detect_country() {
     local country=""
     local tmp_result
 
-    # 并行请求多个 GeoIP API，使用第一个成功的
+    # 依次尝试多个 GeoIP API，使用第一个成功的
     tmp_result=$(mktemp) || {
         echo "UN"
         return
@@ -226,8 +270,8 @@ install_deps() {
         debian|ubuntu)
             wait_for_apt
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y -qq wget curl unzip iptables ip6tables
+            apt-get update -q
+            apt-get install -y -q wget curl unzip iptables ip6tables
             ;;
         centos|rhel|almalinux|rocky|fedora)
             wait_for_dnf
@@ -281,7 +325,8 @@ enable_bbr() {
     if [[ "$bbr_enabled" -eq 1 ]]; then
         log_info "BBR (IPv4) 已经处于开启状态"
     else
-        if [[ ! -f /etc/sysctl.d/99-bbr.conf ]]; then
+        if [[ ! -f /etc/sysctl.d/99-bbr.conf ]] || \
+           ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.d/99-bbr.conf 2>/dev/null; then
             cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -346,21 +391,36 @@ open_firewall_port() {
 close_firewall_port() {
     local port=$1
     local proto=${2:-tcp}
-    log_step "撤销防火墙端口 ${port}/${proto}..."
+    local had_rule=false
 
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         if ufw status numbered 2>/dev/null | grep -qE "\[.*\]\s+${port}/${proto}\s+"; then
             ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+            had_rule=true
         fi
     fi
 
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
+        if firewall-cmd --list-ports 2>/dev/null | grep -qw "${port}/${proto}"; then
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            had_rule=true
+        fi
     fi
 
-    iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
-    ip6tables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+    if iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null; then
+        iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+        had_rule=true
+    fi
+
+    if ip6tables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null; then
+        ip6tables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT -m comment --comment "EASYSNELL-${port}-${proto}" 2>/dev/null || true
+        had_rule=true
+    fi
+
+    if [[ "${had_rule}" == "true" ]]; then
+        log_info "防火墙已撤销 ${port}/${proto}"
+    fi
 }
 
 #===============================================================================
@@ -399,7 +459,7 @@ download_snell() {
 deploy_binary() {
     local tmp_file=$1
     local tmp_dir
-    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
+    tmp_dir=$(mktemp -d /tmp/easysnell.XXXXXX)
     chmod 700 "${tmp_dir}"
 
     if ! unzip -o "${tmp_file}" -d "${tmp_dir}" 2>/dev/null; then
@@ -515,8 +575,8 @@ EOF
 # 备份与恢复
 #===============================================================================
 backup_config() {
-    # 清理 30 天前的旧备份
-    find "${CONF_DIR}" -maxdepth 1 -name "*.bak.*" -mtime +30 -delete 2>/dev/null || true
+    # 清理超过保留天数的旧备份
+    find "${CONF_DIR}" -maxdepth 1 -name "*.bak.*" -mtime +${BACKUP_RETAIN_DAYS} -delete 2>/dev/null || true
 
     if [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
         local conf_bak
@@ -545,6 +605,22 @@ random_port() {
 
 random_psk() {
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${PSK_LENGTH}"
+}
+
+# 查找可用端口（自动模式专用）
+find_available_port() {
+    local retries=0
+    local port
+    port=$(random_port)
+    while ! validate_port "$port"; do
+        retries=$((retries + 1))
+        if [[ $retries -gt 10 ]]; then
+            log_error "无法找到可用端口，请手动指定或检查服务器环境"
+            return 1
+        fi
+        port=$(random_port)
+    done
+    echo "$port"
 }
 
 #===============================================================================
@@ -585,8 +661,8 @@ validate_psk() {
 
 validate_obfs_host() {
     local host=$1
-    if [[ -n "$host" && ! "$host" =~ ^[A-Za-z0-9.-]+$ ]]; then
-        log_warn "非法的 obfs-host，已忽略"
+    if [[ -n "$host" && ! "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        log_warn "非法的 obfs-host: ${host}，已忽略"
         return 1
     fi
     return 0
@@ -609,14 +685,28 @@ validate_dns() {
         if [[ -z "$addr" ]]; then
             continue
         fi
-        # IPv4 或 IPv6 基础校验
-        if [[ ! "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
-           [[ ! "$addr" =~ ^[0-9a-fA-F:]+$ ]]; then
+        if ! _is_valid_ip "$addr"; then
             log_error "非法的 DNS 地址: ${addr}"
             return 1
         fi
     done
     return 0
+}
+
+# IP 地址格式校验（IPv4 + IPv6）
+_is_valid_ip() {
+    local addr=$1
+    # IPv4
+    if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    # IPv6: 必须包含冒号，仅含十六进制和冒号，长度合理
+    if [[ "$addr" == *:* ]] && \
+       [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]] && \
+       [[ ${#addr} -le 45 ]]; then
+        return 0
+    fi
+    return 1
 }
 
 #===============================================================================
@@ -687,8 +777,8 @@ install_snell() {
     local ipv6
     local dns
 
-    # 注册回滚信号处理
-    trap_rollback
+    # 注册统一信号处理
+    setup_traps
     # 创建预安装备份（失败时跳过回滚保护）
     if ! create_pre_install_backup; then
         log_warn "备份创建失败，将跳过回滚保护"
@@ -713,16 +803,7 @@ install_snell() {
     log_info "系统: ${os} | 架构: ${arch} | IP: ${ip}"
 
     if [[ "$auto" == "true" ]]; then
-        port=$(random_port)
-        local retries=0
-        while ! validate_port "$port"; do
-            retries=$((retries + 1))
-            if [[ $retries -gt 10 ]]; then
-                log_error "无法找到可用端口，请手动指定或检查服务器环境"
-                exit 1
-            fi
-            port=$(random_port)
-        done
+        port=$(find_available_port) || exit 1
         psk=$(random_psk)
         ipv6="true"
         udp="true"
@@ -792,21 +873,14 @@ install_snell() {
     fi
 
     local tmp_file
-    local tmp_dir
     tmp_file=$(mktemp)
-    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
-    chmod 700 "${tmp_dir}"
-    trap 'rm -f "${tmp_file}"; rm -rf "${tmp_dir}"' EXIT ERR
+    _CLEANUP_TMP_FILE="${tmp_file}"
 
     download_snell "${arch}" "${tmp_file}"
     deploy_binary "${tmp_file}"
 
     rm -f "${tmp_file}"
-    rm -rf "${tmp_dir}"
-    trap - EXIT
-    trap - ERR
-    # 注册成功退出清理
-    trap_cleanup
+    _CLEANUP_TMP_FILE=""
 
     create_snell_user "${os}"
 
@@ -845,43 +919,49 @@ install_snell() {
         open_firewall_port "${port}" "udp"
     fi
 
+    # IPv6 地址在 Surge 配置中需要方括号包裹
+    local ip_display="${ip}"
+    if [[ "$ip" == *:* ]]; then
+        ip_display="[${ip}]"
+    fi
+
     cat > "${CONF_DIR}/surge-config.txt" << EOF
 # Snell Server Config
 # 生成时间: $(date '+%Y-%m-%dT%H:%M:%S%z')
 # 服务器IP: ${ip}
 # 注意: 请妥善保管 PSK，不要在公共日志中记录
 
-${country} = snell, ${ip}, ${port}, psk = ${psk}, version = 5, reuse = true${obfs:+, obfs = $obfs}${obfs_host:+, obfs-host = $obfs_host}
+${country} = snell, ${ip_display}, ${port}, psk = ${psk}, version = 5, reuse = true${obfs:+, obfs = $obfs}${obfs_host:+, obfs-host = $obfs_host}
 EOF
     chmod 640 "${CONF_DIR}/surge-config.txt" 2>/dev/null || true
     chown snell:snell "${CONF_DIR}/surge-config.txt" 2>/dev/null || true
 
     echo ""
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "${GREEN}       Snell 部署成功!${RESET}"
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "  服务器IP: ${ip}"
-    echo -e "  端口:     ${port}"
+    printf '%b\n' "${CYAN}============================================${RESET}"
+    printf '%b\n' "${GREEN}       Snell 部署成功!${RESET}"
+    printf '%b\n' "${CYAN}============================================${RESET}"
+    printf '  服务器IP: %s\n' "${ip}"
+    printf '  端口:     %s\n' "${port}"
     # PSK 用掩码显示，只显示前4位和后4位
     local psk_masked="${psk:0:4}...${psk: -4}"
-    echo -e "  PSK:      ${psk_masked}"
-    echo -e "  IPv6:     ${ipv6}"
-    echo -e "  UDP:      ${udp}"
+    printf '  PSK:      %s\n' "${psk_masked}"
+    printf '  IPv6:     %s\n' "${ipv6}"
+    printf '  UDP:      %s\n' "${udp}"
     if [[ -n "$obfs" ]]; then
-        echo -e "  OBFS:     ${obfs}"
+        printf '  OBFS:     %s\n' "${obfs}"
     fi
     if [[ -n "$obfs_host" ]]; then
-        echo -e "  OBFS-HOST: ${obfs_host}"
+        printf '  OBFS-HOST: %s\n' "${obfs_host}"
     fi
-    echo -e "${CYAN}--------------------------------------------${RESET}"
-    echo -e "${YELLOW}Surge 配置行:${RESET}"
+    printf '%b\n' "${CYAN}--------------------------------------------${RESET}"
+    printf '%b\n' "${YELLOW}Surge 配置行:${RESET}"
     grep -v '^#' "${CONF_DIR}/surge-config.txt"
-    echo -e "${CYAN}============================================${RESET}"
-    echo -e "配置文件路径: ${CONF_DIR}/snell-server.conf"
-    echo -e "Surge 配置路径: ${CONF_DIR}/surge-config.txt"
-    echo -e "管理命令: systemctl {start|stop|restart|status} snell"
-    echo -e "查看日志: journalctl -u snell -f"
-    echo -e "${YELLOW}注意: 请妥善保管 PSK，完整 PSK 已在配置文件中。${RESET}"
+    printf '%b\n' "${CYAN}============================================${RESET}"
+    printf '配置文件路径: %s\n' "${CONF_DIR}/snell-server.conf"
+    printf 'Surge 配置路径: %s\n' "${CONF_DIR}/surge-config.txt"
+    printf '管理命令: systemctl {start|stop|restart|status} snell\n'
+    printf '查看日志: journalctl -u snell -f\n'
+    printf '%b\n' "${YELLOW}注意: 请妥善保管 PSK，完整 PSK 已在配置文件中。${RESET}"
     echo ""
 }
 
@@ -894,13 +974,11 @@ update_snell() {
         return
     fi
 
-    # 备份旧版本（更新前）
-    log_step "正在备份当前版本..."
-    local snell_bak="${SNELL_DIR}/snell-server.bak.$(date +%s).${RANDOM}"
-    if ! cp -p "${SNELL_DIR}/snell-server" "${snell_bak}" 2>/dev/null; then
-        log_warn "备份旧版本失败，继续更新"
+    # 注册统一信号处理 + 回滚保护
+    setup_traps
+    if ! create_pre_install_backup; then
+        log_warn "备份创建失败，将跳过回滚保护"
     fi
-    log_info "旧版本已备份至 ${snell_bak}"
 
     log_step "正在更新 Snell..."
 
@@ -908,17 +986,12 @@ update_snell() {
     arch=$(detect_arch)
 
     local tmp_file
-    local tmp_dir
     tmp_file=$(mktemp)
-    tmp_dir=$(mktemp -d -p /tmp/easysnell.XXXXXX)
-    chmod 700 "${tmp_dir}"
-    trap 'rm -f "${tmp_file}"; rm -rf "${tmp_dir}"; systemctl start snell 2>/dev/null || true' EXIT ERR
+    _CLEANUP_TMP_FILE="${tmp_file}"
 
     if ! download_snell "${arch}" "${tmp_file}"; then
         rm -f "${tmp_file}"
-        rm -rf "${tmp_dir}"
-        # 恢复服务（更新失败时）
-        systemctl start snell 2>/dev/null || true
+        _CLEANUP_TMP_FILE=""
         exit 1
     fi
 
@@ -930,15 +1003,9 @@ update_snell() {
     deploy_binary "${tmp_file}"
 
     rm -f "${tmp_file}"
-    rm -rf "${tmp_dir}"
+    _CLEANUP_TMP_FILE=""
 
-    if systemctl restart snell; then
-        trap - EXIT
-        trap - ERR
-        log_info "更新完成"
-    else
-        trap - EXIT
-        trap - ERR
+    if ! systemctl restart snell; then
         log_error "更新后服务启动失败"
         journalctl -u snell --no-pager -n "${JOURNAL_TAIL_LINES}" || true
         exit 1
@@ -952,6 +1019,11 @@ update_snell() {
         journalctl -u snell --no-pager -n "${JOURNAL_TAIL_LINES}" || true
         exit 1
     fi
+
+    # 清理旧的二进制备份（超过 BACKUP_RETAIN_DAYS 天）
+    find "${SNELL_DIR}" -maxdepth 1 -name 'snell-server.bak.*' -mtime +${BACKUP_RETAIN_DAYS} -delete 2>/dev/null || true
+
+    log_info "更新完成"
 }
 
 uninstall_snell() {
@@ -1034,10 +1106,10 @@ show_menu() {
     fi
 
     echo ""
-    echo -e "${GREEN}======== EasySnell 管理工具 v${SCRIPT_VERSION} ========${RESET}"
-    echo -e "  安装状态: ${installed}"
-    echo -e "  运行状态: ${running}"
-    echo -e "  当前版本: ${ver}"
+    printf '%b\n' "${GREEN}======== EasySnell 管理工具 v${SCRIPT_VERSION} ========${RESET}"
+    printf '  安装状态: %s\n' "${installed}"
+    printf '  运行状态: %s\n' "${running}"
+    printf '  当前版本: %s\n' "${ver}"
     echo ""
     echo "  1. 安装 Snell 服务"
     echo "  2. 卸载 Snell 服务"
@@ -1051,7 +1123,7 @@ show_menu() {
     echo "  4. 更新 Snell 服务"
     echo "  5. 查看 Snell 配置"
     echo "  0. 退出"
-    echo -e "${GREEN}=============================================${RESET}"
+    printf '%b\n' "${GREEN}=============================================${RESET}"
     read -rp "请选择 [0-5]: " choice
 }
 
@@ -1102,20 +1174,13 @@ cleanup_backup() {
     ROLLBACK_REQUIRED=0
 }
 
-# 注册信号处理回滚
-trap_rollback() {
-    trap 'rollback; exit 130' INT TERM
-}
-
-# 注册成功退出清理
-trap_cleanup() {
-    trap 'cleanup_backup; exit 0' EXIT
-}
+# 注册信号处理回滚（已由 setup_traps 统一管理）
+# 注册成功退出清理（已由 _on_exit 统一管理）
 
 # 创建安装前备份（用于回滚）
 create_pre_install_backup() {
     if [[ -f "${SNELL_DIR}/snell-server" ]] || [[ -f "${CONF_DIR}/snell-server.conf" ]]; then
-        SNELL_BACKUP_DIR=$(mktemp -d -p /tmp/easysnell-backup.XXXXXX)
+        SNELL_BACKUP_DIR=$(mktemp -d /tmp/easysnell-backup.XXXXXX)
         if [[ -z "$SNELL_BACKUP_DIR" || ! -d "$SNELL_BACKUP_DIR" ]]; then
             log_error "无法创建备份目录，请检查 /tmp 空间"
             return 1
